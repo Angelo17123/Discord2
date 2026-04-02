@@ -16,6 +16,7 @@ let resumeGatewayUrl = null;
 const MAX_RECONNECT = 10;
 let shuttingDown = false;
 let reconnectTimer = null;
+let explicitReconnect = false;
 
 function clearReconnectTimer() {
   if (reconnectTimer) {
@@ -198,6 +199,7 @@ function connect() {
       case 7: {
         console.log('[GATEWAY] Reconnect requested');
         reconnectAttempts++;
+        explicitReconnect = true;
         scheduleReconnect(1000);
         destroyWs();
         break;
@@ -210,6 +212,7 @@ function connect() {
         resumeGatewayUrl = null;
         currentVoiceChannel = null;
         reconnectAttempts++;
+        explicitReconnect = true;
         scheduleReconnect(5000);
         destroyWs();
         break;
@@ -234,6 +237,12 @@ function connect() {
       return;
     }
 
+    if (explicitReconnect) {
+      explicitReconnect = false;
+      console.log('[GATEWAY] Reconnect already scheduled, skipping close handler.');
+      return;
+    }
+
     if (code === 1005 || code === 1006) {
       reconnectAttempts++;
       const delay = Math.min(5000 * reconnectAttempts, 30000);
@@ -247,24 +256,26 @@ function connect() {
   });
 }
 
-process.stdin.on('data', (data) => {
-  const input = data.toString().trim();
-  const parts = input.split(/\s+/);
+if (process.stdin.isTTY || process.stdin.readable) {
+  process.stdin.on('data', (data) => {
+    const input = data.toString().trim();
+    const parts = input.split(/\s+/);
 
-  if (parts[0] === '!move' && parts[1]) {
-    console.log(`[CMD] Moving to ${parts[1]}`);
-    joinVoiceChannel(GUILD_ID, parts[1]);
-  }
+    if (parts[0] === '!move' && parts[1]) {
+      console.log(`[CMD] Moving to ${parts[1]}`);
+      joinVoiceChannel(GUILD_ID, parts[1]);
+    }
 
-  if (parts[0] === '!leave') {
-    console.log('[CMD] Disconnecting from voice');
-    disconnectVoice(GUILD_ID);
-  }
+    if (parts[0] === '!leave') {
+      console.log('[CMD] Disconnecting from voice');
+      disconnectVoice(GUILD_ID);
+    }
 
-  if (parts[0] === '!status') {
-    console.log(`[STATUS] Voice channel: ${currentVoiceChannel || 'none'}`);
-  }
-});
+    if (parts[0] === '!status') {
+      console.log(`[STATUS] Voice channel: ${currentVoiceChannel || 'none'}`);
+    }
+  });
+}
 
 function gracefulShutdown(signal) {
   if (shuttingDown) return;
