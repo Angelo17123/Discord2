@@ -5,7 +5,7 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
 const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL_ID;
 
-let ws;
+let ws = null;
 let heartbeatInterval = null;
 let sequence = null;
 let sessionId = null;
@@ -15,6 +15,14 @@ let reconnectAttempts = 0;
 let resumeGatewayUrl = null;
 const MAX_RECONNECT = 10;
 let shuttingDown = false;
+let reconnectTimer = null;
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
 
 function send(data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -29,16 +37,19 @@ function startHeartbeat(interval) {
   }, interval);
 }
 
+function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
+
 function identify() {
   send({
     op: 2,
     d: {
       token: TOKEN,
-      properties: {
-        os: 'linux',
-        browser: 'chrome',
-        device: 'chrome',
-      },
+      properties: { os: 'linux', browser: 'chrome', device: 'chrome' },
       intents: 0,
     },
   });
@@ -87,35 +98,39 @@ function disconnectVoice(guildId) {
   console.log('[VOICE] Disconnected from voice');
 }
 
-function cleanup() {
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval);
-    heartbeatInterval = null;
-  }
+function destroyWs() {
+  stopHeartbeat();
+  clearReconnectTimer();
   if (ws) {
     ws.removeAllListeners();
-    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-      ws.close(1000, 'Bot shutting down');
-    }
+    ws.terminate();
     ws = null;
   }
 }
 
+function scheduleReconnect(delay) {
+  clearReconnectTimer();
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, delay);
+}
+
 function connect() {
   if (shuttingDown) return;
+
+  destroyWs();
+
   if (reconnectAttempts >= MAX_RECONNECT) {
     console.log('[GATEWAY] Max reconnect attempts reached. Stopping.');
     process.exit(1);
   }
-
-  cleanup();
 
   const gatewayUrl = resumeGatewayUrl || 'wss://gateway.discord.gg/?v=9&encoding=json';
   ws = new WebSocket(gatewayUrl);
 
   ws.on('open', () => {
     console.log('[GATEWAY] Connected');
-    reconnectAttempts = 0;
   });
 
   ws.on('message', (data) => {
@@ -147,20 +162,20 @@ function connect() {
       }
 
       case 0: {
-        if (t === 'READY' || t === 'READY_SUPPLEMENTAL') {
-          if (t === 'READY') {
-            userId = d.user.id;
-            sessionId = d.session_id;
-            console.log(`[READY] ${d.user.username}#${d.user.discriminator} (${d.user.id})`);
-            console.log(`[VOICE] Joining channel ${TARGET_CHANNEL_ID}...`);
-            joinVoiceChannel(GUILD_ID, TARGET_CHANNEL_ID);
-            console.log('[BOT] Bot is now muted + deafened and will stay permanently in the target channel.');
-            console.log('[BOT] Commands: !move <channel_id>, !leave');
-          }
+        if (t === 'READY') {
+          userId = d.user.id;
+          sessionId = d.session_id;
+          reconnectAttempts = 0;
+          console.log(`[READY] ${d.user.username}#${d.user.discriminator} (${d.user.id})`);
+          console.log(`[VOICE] Joining channel ${TARGET_CHANNEL_ID}...`);
+          joinVoiceChannel(GUILD_ID, TARGET_CHANNEL_ID);
+          console.log('[BOT] Bot is now muted + deafened and will stay permanently in the target channel.');
+          console.log('[BOT] Commands: !move <channel_id>, !leave');
         }
 
         if (t === 'RESUMED') {
           console.log('[GATEWAY] Session resumed successfully');
+          reconnectAttempts = 0;
           if (currentVoiceChannel) {
             console.log(`[VOICE] Rejoining channel ${currentVoiceChannel}...`);
             joinVoiceChannel(GUILD_ID, currentVoiceChannel);
@@ -182,8 +197,9 @@ function connect() {
 
       case 7: {
         console.log('[GATEWAY] Reconnect requested');
-        ws.close();
-        setTimeout(connect, 1000);
+        reconnectAttempts++;
+        scheduleReconnect(1000);
+        destroyWs();
         break;
       }
 
@@ -193,8 +209,9 @@ function connect() {
         sequence = null;
         resumeGatewayUrl = null;
         currentVoiceChannel = null;
-        cleanup();
-        setTimeout(connect, 5000);
+        reconnectAttempts++;
+        scheduleReconnect(5000);
+        destroyWs();
         break;
       }
     }
@@ -202,19 +219,26 @@ function connect() {
 
   ws.on('close', (code, reason) => {
     console.log(`[GATEWAY] Closed - Code: ${code}`);
-    if (heartbeatInterval) {
-      clearInterval(heartbeatInterval);
-      heartbeatInterval = null;
-    }
+    stopHeartbeat();
 
-    if (code !== 1000 && code !== 4004 && !shuttingDown) {
-      reconnectAttempts++;
-      const delay = Math.min(5000 * reconnectAttempts, 30000);
-      console.log(`[GATEWAY] Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT})...`);
-      setTimeout(connect, delay);
-    } else if (code === 4004) {
+    if (code === 4004) {
       console.log('[GATEWAY] Authentication failed. Check your token.');
       process.exit(1);
+      return;
+    }
+
+    if (shuttingDown) return;
+
+    if (code === 1000) {
+      console.log('[GATEWAY] Clean close. Not reconnecting.');
+      return;
+    }
+
+    if (code === 1005 || code === 1006) {
+      reconnectAttempts++;
+      const delay = Math.min(5000 * reconnectAttempts, 30000);
+      console.log(`[GATEWAY] Abnormal close. Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT})...`);
+      scheduleReconnect(delay);
     }
   });
 
@@ -249,7 +273,7 @@ function gracefulShutdown(signal) {
   if (currentVoiceChannel) {
     disconnectVoice(GUILD_ID);
   }
-  cleanup();
+  destroyWs();
   setTimeout(() => {
     console.log('[BOT] Shutdown complete.');
     process.exit(0);
